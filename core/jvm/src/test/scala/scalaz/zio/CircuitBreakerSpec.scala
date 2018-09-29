@@ -47,21 +47,38 @@ class CircuitBreakerSpec extends AbstractRTSSpec {
 
   import scala.concurrent.duration._
   def e2 =
-    unsafeRun(for {
-      circuit <- Circuit[String, Int]("Rejected", 1, 1.second)
-      v       <- circuit.process(IO.fail(Failed)).attempt
-      w       <- circuit.process(IO.point(Success)).attempt
-      _       <- circuit.process(IO.fail(Failed)).attempt
-      _       <- circuit.process(IO.fail(Failed)).attempt
-      x       <- circuit.process(IO.fail(Failed)).attempt
-      y       <- circuit.process(IO.point(Success)).attempt
-      z       <- IO.sleep(2.seconds) *> circuit.process(IO.point(Success)).attempt
-    } yield {
-      (v must beLeft[Any](Failed))
-        .and(w must beRight[State](Success))
-        .and(x must beLeft[Any]("Rejected"))
-        .and(y must beLeft[Any]("Rejected"))
-        .and(z must beRight[State](Success))
-    })
+    {
+      val policy =  Schedule.spaced(1.second)
+      unsafeRun(for {
+        circuit <- Circuit[State, String, Int]("Rejected", 1, policy)
+        v       <- circuit.process(IO.fail(Failed)).attempt
+        nbR1 <- circuit.currentState
+        w       <- circuit.process(IO.point(Success)).attempt
+        nbR2    <- circuit.currentState
+        _       <- circuit.process(IO.fail(Failed)).attempt
+        nbR3    <- circuit.currentState
+        _       <- circuit.process(IO.fail(Failed)).attempt
+        nbR4    <- circuit.currentState
+        x       <- circuit.process(IO.fail(Failed)).attempt
+        nbR5    <- circuit.currentState
+        y       <- circuit.process(IO.point(Success)).attempt
+        nbR6    <- circuit.currentState
+        z <- IO.sleep(2.seconds) *> circuit.process(IO.point(Success)).attempt
+        nbR7 <- circuit.currentState
+      } yield {
+        (v must beLeft[Any](Failed))
+          .and(nbR1 must_=== Circuit.Closed(1))
+          .and(w must beRight[State](Success))
+          .and(nbR2 must_=== Circuit.Closed(0))
+          .and(nbR3 must_=== Circuit.Closed(1))
+          .and(nbR4 must_=== Circuit.Open(Failed, policy))
+          .and(x must beLeft[Any]("Rejected"))
+          .and(nbR5 must_=== Circuit.Open(Failed, policy))
+          .and(y must beLeft[Any]("Rejected"))
+          .and(nbR6 must_=== nbR5)
+          .and(z must beRight[State](Success))
+          .and(nbR7 must_=== Circuit.Closed(0))
+      })
+    }
 
 }
