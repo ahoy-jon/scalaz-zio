@@ -1,85 +1,140 @@
 package scalaz.zio
 
-import scalaz.zio.CircuitBreaker.Open
+import scalaz.zio.CircuitBreaker.CircuitStatus._
+
+import scala.concurrent.duration.{ Duration, _ }
 
 class CircuitBreakerSpec extends AbstractRTSSpec {
-  def is = "CircuitBreakerSpec".title ^ s2"""
-     protect must work correctly $e1
-     circuit breaker using schedule $e2
+  def is =
+    "CircuitBreakerSpec".title ^
+      s2"""
+     circuit breaker for a given configuration
+        call bunch of failed IOs must increment failures in Closed status then succeed $e1
+        call bunch of failed IOs exceeding maxFailures must turn the status to Open $e2
+        call bunch of failed IOs must turn the status to HalfOpen after the duration of Open $e3
+        call bunch of IOs $e4
+        call $e
+        check race $e6
     """
 
   sealed trait State
+
   object State {
-    case object Failed      extends State
-    case object Success     extends State
+
+    case object Failed extends State
+
+    case object Success extends State
+
     case object CircuitOpen extends State
+
   }
 
   import State._
 
-  def e1 =
-    unsafeRun(for {
-      circuit <- CircuitBreaker(2, IO.fail(CircuitOpen))
-      v       <- circuit.protect(IO.fail(Failed)).attempt
-      nbR1    <- circuit.nbRemainingFailure
-      w       <- circuit.protect(IO.point(Success)).attempt
-      nbR2    <- circuit.nbRemainingFailure
-      _       <- circuit.protect(IO.fail(Failed)).attempt
-      nbR3    <- circuit.nbRemainingFailure
-      _       <- circuit.protect(IO.fail(Failed)).attempt
-      nbR4    <- circuit.nbRemainingFailure
-      status  <- circuit.status
-      x       <- circuit.protect(IO.point(Success)).attempt
-      nbR5    <- circuit.nbRemainingFailure
-      y       <- circuit.protect(IO.fail(Failed)).attempt
-    } yield {
-      (v must beLeft[State](Failed))
-        .and(nbR1 must_=== 1)
-        .and(w must beRight[State](Success))
-        .and(nbR2 must_=== 2)
-        .and(nbR3 must_=== 1)
-        .and(nbR4 must_=== 0)
-        .and(status must_=== Open)
-        .and(nbR5 must_=== 0)
-        .and(x must beLeft[State](CircuitOpen))
-        .and(y must beLeft[State](CircuitOpen))
-    })
+  def e1 = unsafeRun(
+    for {
+      circuit <- CircuitBreaker[String](3, 1.second, Duration.Zero, "Rejected")
+      status0 <- circuit.status
+      io1     <- circuit(IO.fail("Error-1")).attempt
+      status1 <- circuit.status
+      io2     <- circuit(IO.fail("Error-2")).attempt
+      status2 <- circuit.status
+      io3     <- circuit(IO.fail("Error-3")).attempt
+      status3 <- circuit.status
+    } yield
+      (status0 must_=== Closed(0))
+        .and(status1 must_=== Closed(1))
+        .and(status2 must_=== Closed(2))
+        .and(status3 must_=== Closed(3))
+        .and(io1 must beLeft("Error-1"))
+        .and(io2 must beLeft("Error-2"))
+        .and(io3 must beLeft("Error-3"))
+  )
 
-  import scala.concurrent.duration._
-  def e2 =
+  def e2 = unsafeRun(
+    for {
+      circuit <- CircuitBreaker[String](2, 1.second, Duration.Zero, "Rejected")
+      status0 <- circuit.status
+      io1     <- circuit(IO.fail("Error-1")).attempt
+      status1 <- circuit.status
+      io2     <- circuit(IO.fail("Error-2")).attempt
+      status2 <- circuit.status
+      io3     <- circuit(IO.fail("Error-3")).attempt
+      status3 <- circuit.status
+      io4     <- circuit(IO.fail("Error-4")).attempt
+      status4 <- circuit.status
+    } yield
+      (status0 must_=== Closed(0))
+        .and(status1 must_=== Closed(1))
+        .and(status2 must_=== Closed(2))
+        .and(status3 must beAnInstanceOf[Open])
+        .and(io1 must beLeft("Error-1"))
+        .and(io2 must beLeft("Error-2"))
+        .and(io3 must beLeft("Error-3"))
+        .and(io4 must beLeft("Rejected"))
+  )
+
+  def e3 = unsafeRun(
+    for {
+      circuit <- CircuitBreaker[String](1, 300.millis, 200.millis, "Rejected")
+      status  <- circuit.status
+      _       <- circuit.forceOpen
+      status0 <- circuit.status
+      _       <- IO.sleep(300.millis)
+      _       <- circuit.tick
+      status1 <- circuit.status
+
+    } yield {
+      (status must beAnInstanceOf[Closed])
+        .and(status0 must beAnInstanceOf[Open])
+        .and(status1 must beAnInstanceOf[HalfOpen])
+    }
+  )
+
+  def e = unsafeRun {
+    for {
+      circuit <- CircuitBreaker[Int](1, 1.second, Duration.Zero, -1)
+      _       <- circuit.forceOpen
+      v       <- circuit(IO.never).attempt
+    } yield {
+      v must beLeft(-1)
+    }
+  }
+
+  def e6 = unsafeRun(
+    IO.point(1).race(IO.point(2)).map(x => x must beEqualTo(1))
+  )
+
+  def e4 =
     unsafeRun(for {
-      circuit <- Circuit[State](1, 1.second, Duration.Zero, CircuitOpen)
-      v       <- circuit.process(IO.fail(Failed)).attempt
-      nbR1    <- circuit.getCurrentState
-      w       <- circuit.process(IO.point(Success)).attempt
-      nbR2    <- circuit.getCurrentState
-      _       <- circuit.process(IO.fail(Failed)).attempt
-      nbR3    <- circuit.getCurrentState
-      _       <- circuit.process(IO.fail(Failed)).attempt
-      nbR4    <- circuit.getCurrentState
-      x       <- circuit.process(IO.fail(Failed)).attempt
-      nbR5    <- circuit.getCurrentState
-      y       <- circuit.process(IO.point(Success)).attempt
-      nbR6    <- circuit.getCurrentState
-      z       <- IO.sleep(2.seconds) *> circuit.process(IO.point(Success)).attempt
-      nbR7    <- circuit.getCurrentState
-      success <- circuit.process(IO.point(Success)).attempt
-      nbC     <- circuit.getCurrentState
+      circuit <- CircuitBreaker[State](maxFailures = 1,
+                                       durationO = 300.millis,
+                                       durationH = Duration.Zero,
+                                       rejected = CircuitOpen)
+      v    <- circuit(IO.fail(Failed)).attempt
+      nbR1 <- circuit.status
+      w    <- circuit(IO.point(Success)).attempt
+      nbR2 <- circuit.status
+      _    <- circuit(IO.fail(Failed)).attempt
+      nbR3 <- circuit.status
+      _    <- circuit(IO.fail(Failed)).attempt
+      nbR4 <- circuit.status
+      x    <- circuit(IO.fail(Failed)).attempt
+      nbR5 <- circuit.status
+      _    <- IO.sleep(300.millis)
+      y    <- circuit(IO.point(Success)).attempt
+      nbR6 <- circuit.status
     } yield {
       (v must beLeft[Any](Failed))
-        .and(nbR1 must_=== Circuit.CircuitStatus.Closed(1))
+        .and(nbR1 must_=== Closed(1))
         .and(w must beRight[State](Success))
-        .and(nbR2 must_=== Circuit.CircuitStatus.Closed(0))
-        .and(nbR3 must_=== Circuit.CircuitStatus.Closed(1))
-        .and(nbR4 must beAnInstanceOf[Circuit.CircuitStatus.Open])
+        .and(nbR2 must_=== Closed(0))
+        .and(nbR3 must_=== Closed(1))
+        .and(nbR4 must beAnInstanceOf[Open])
         .and(x must beLeft[Any](CircuitOpen))
-        .and(nbR5 must beAnInstanceOf[Circuit.CircuitStatus.Open])
-        .and(y must beLeft[Any](CircuitOpen))
-        .and(nbR6 must_=== nbR5)
-        .and(z must beLeft[State](CircuitOpen))
-        .and(nbR7 must beAnInstanceOf[Circuit.CircuitStatus.HalfOpen])
-        .and(success must beRight[State](Success))
-        .and(nbC must_=== Circuit.CircuitStatus.Closed(0))
+        .and(nbR5 must beAnInstanceOf[Open])
+        .and(y must beRight[State](Success))
+        .and(nbR6 must_=== Closed(0))
     })
 
 }
