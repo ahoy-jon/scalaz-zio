@@ -25,10 +25,10 @@ final class CircuitBreaker[+R] private (
             case _ =>
               io.redeem(
                 err => {
-                 updateStateWithIO(state)(current => current.fail(now, circuitConfiguration)) *> IO.fail(err)
+                  updateStateWithIO(state)(current => current.fail(now, circuitConfiguration)) *> IO.fail(err)
                 },
                 value => {
-                 updateStateWithIO(state)(current => current.succ(circuitConfiguration)) *> IO.point(value)
+                  updateStateWithIO(state)(current => current.succ(circuitConfiguration)) *> IO.point(value)
                 }
               )
           }
@@ -39,22 +39,22 @@ final class CircuitBreaker[+R] private (
   def tick: IO[Nothing, Unit] =
     for {
       now <- scalaz.zio.system.currentTimeMillis
-      _   <- state.update(_.checkStatus(now, circuitConfiguration))
+      _   <- state.update(_.checkStatus(now))
     } yield {}
 
   def forceOpen: IO[Nothing, Unit] =
     for {
-      now <- scalaz.zio.system.currentTimeMillis
-      _   <- state.set(Open(circuitConfiguration.durationOpen.toMillis + now))
-
-    } yield {}
+      now          <- scalaz.zio.system.currentTimeMillis
+      initialState <- circuitConfiguration.openPolicy.initial
+      decision     <- circuitConfiguration.openPolicy.update({}, initialState)
+      unit         <- state.set(Open(decision.delay.toMillis + now))
+    } yield unit
 }
 
 object CircuitBreaker {
 
   def updateStateWithIO[X](ref: Ref[X])(f: X => IO[Nothing, X]): IO[Nothing, Unit] =
-    ref.get flatMap	f flatMap	ref.set
-
+    ref.get flatMap f flatMap ref.set
 
   trait RejectedReplacement[+R] {
     def rejectedWhenOpen(circuitWillTryToResetIn: Long): R
@@ -76,29 +76,33 @@ object CircuitBreaker {
 
   }
 
-  case class CircuitConfiguration(keepClosed: Schedule[Any, Any], durationOpen: Duration, durationH: Duration)
+  case class CircuitConfiguration(keepClosed: Schedule[Any, Any], openPolicy: Schedule[Any, Any], durationH: Duration)
 
   sealed trait CircuitStatus {
 
     self =>
 
     final def checkStatus(
-      now: Long,
-      conf: CircuitConfiguration
+      now: Long
+      //, conf: CircuitConfiguration
     ): CircuitStatus =
       self match {
-        case Open(forceOpenUntil) if forceOpenUntil < now => HalfOpen(conf.durationH.toMillis + now)
+        case Open(forceOpenUntil) if forceOpenUntil < now => HalfOpen
         case _                                            => self
       }
 
-    final def succ(
-      configuration: CircuitConfiguration
-    ): IO[Nothing, CircuitStatus] =
+    final def succ(conf: CircuitConfiguration): IO[Nothing, CircuitStatus] =
       self match {
-        case Open(_) => IO.now(self)
-        case _ =>
-          val value: IO[Nothing, Closed] = configuration.keepClosed.initial.map(x => Closed(x))
-          value
+        case _: Open => IO.now(self)
+        case _       => conf.keepClosed.initial.map(x => Closed(x))
+      }
+
+    private final def open(now: Long, conf: CircuitConfiguration): IO[Nothing, Open] =
+      for {
+        initOpen <- conf.openPolicy.initial
+        decision <- conf.openPolicy.update({}, initOpen)
+      } yield {
+        Open(decision.delay.toMillis + now)
       }
 
     final def fail(
@@ -110,17 +114,16 @@ object CircuitBreaker {
         case Closed(state) =>
           conf.keepClosed
             .update({}, state.asInstanceOf[conf.keepClosed.State])
-            .map(decision => {
+            .flatMap(decision => {
               if (decision.cont)
-                Closed(decision.state)
+                IO.now(Closed(decision.state))
               else {
-                Open(conf.durationOpen.toMillis + now)
+                open(now, conf)
               }
             })
 
-        //BUG ! ?
-        case HalfOpen(d) => IO.now(Open(d + now))
-        case _           => IO.now(self)
+        case HalfOpen => open(now, conf)
+        case _        => IO.now(self)
       }
 
     final def success(
@@ -128,7 +131,7 @@ object CircuitBreaker {
       conf: CircuitConfiguration
     ): IO[Nothing, CircuitStatus] =
       self match {
-        case Open(forceOpenUntil) if forceOpenUntil < now => IO.now(HalfOpen(conf.durationH.toMillis + now))
+        case Open(forceOpenUntil) if forceOpenUntil < now => IO.now(HalfOpen)
         case _                                            => conf.keepClosed.initial.map(state => Closed(state))
       }
   }
@@ -139,7 +142,7 @@ object CircuitBreaker {
 
     final case class Open(forceOpenUntil: Long) extends CircuitStatus
 
-    final case class HalfOpen(retryUntil: Long) extends CircuitStatus
+    final case object HalfOpen extends CircuitStatus
 
   }
 
@@ -148,7 +151,7 @@ object CircuitBreaker {
                      durationH: Duration,
                      rejected: E): IO[Nothing, CircuitBreaker[E]] = {
 
-    val configuration = CircuitConfiguration(Schedule.recurs(maxFailures + 1), durationO, durationH)
+    val configuration = CircuitConfiguration(Schedule.recurs(maxFailures + 1), Schedule.spaced(durationO), durationH)
 
     for {
       initialState <- configuration.keepClosed.initial
@@ -159,8 +162,7 @@ object CircuitBreaker {
         configuration,
         new RejectedReplacement[E] {
           override def rejectedWhenOpen(circuitWillTryToResetIn: Long): E = rejected
-
-          override def rejectedWhenHalfOpen: E = rejected
+          override def rejectedWhenHalfOpen: E                            = rejected
         } //,
         //StatusChangeCallbacks.nocallbacks,
         //RejectionCallbacks.nocallbacks

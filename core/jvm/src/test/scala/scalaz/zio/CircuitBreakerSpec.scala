@@ -87,7 +87,7 @@ class CircuitBreakerSpec extends AbstractRTSSpec {
     } yield {
       (status must beAnInstanceOf[Closed])
         .and(status0 must beAnInstanceOf[Open])
-        .and(status1 must beAnInstanceOf[HalfOpen])
+        .and(status1 must beAnInstanceOf[HalfOpen.type])
     }
   )
 
