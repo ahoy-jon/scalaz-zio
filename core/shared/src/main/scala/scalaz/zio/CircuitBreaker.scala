@@ -5,12 +5,11 @@ import scalaz.zio.CircuitBreaker._
 
 import scala.concurrent.duration.Duration
 
-final class CircuitBreaker[+R] private (
-  state: Ref[CircuitStatus],
-  circuitConfiguration: CircuitConfiguration,
-  rejectedReplacement: RejectedReplacement[R] //,
-  //statusChangeCallbacks: StatusChangeCallbacks,
-  //rejectionCallbacks: RejectionCallbacks
+final class CircuitBreaker[+R] private (state: Ref[CircuitStatus],
+                                        circuitConfiguration: CircuitConfiguration,
+                                        rejectedReplacement: RejectedReplacement[R] //,
+                                        //statusChangeCallbacks: StatusChangeCallbacks,
+                                        //rejectionCallbacks: RejectionCallbacks
 ) {
 
   import CircuitBreaker._
@@ -23,14 +22,10 @@ final class CircuitBreaker[+R] private (
       x <- currentState match {
             case Open(openUtil) => IO.fail(rejectedReplacement.rejectedWhenOpen(openUtil - now))
             case _ =>
-              io.redeem(
-                err => {
-                  updateStateWithIO(state)(current => current.fail(now, circuitConfiguration)) *> IO.fail(err)
-                },
-                value => {
-                  updateStateWithIO(state)(current => current.succ(circuitConfiguration)) *> IO.point(value)
-                }
-              )
+              peekRedem(io)(
+                _ =>  updateStateWithIO(state)(_.fail(now,circuitConfiguration)),
+                _ =>  updateStateWithIO(state)(_.succ(circuitConfiguration)))
+
           }
     } yield x
 
@@ -38,9 +33,9 @@ final class CircuitBreaker[+R] private (
 
   def tick: IO[Nothing, Unit] =
     for {
-      now <- scalaz.zio.system.currentTimeMillis
-      _   <- state.update(_.checkStatus(now))
-    } yield {}
+      now   <- scalaz.zio.system.currentTimeMillis
+      unit  <- state.update(_.checkStatus(now)).void
+    } yield unit
 
   def forceOpen: IO[Nothing, Unit] =
     for {
@@ -53,8 +48,17 @@ final class CircuitBreaker[+R] private (
 
 object CircuitBreaker {
 
-  def updateStateWithIO[X](ref: Ref[X])(f: X => IO[Nothing, X]): IO[Nothing, Unit] =
-    ref.get flatMap f flatMap ref.set
+  protected def peekRedem[E,A, E2 >: E](io:IO[E,A])(err:E => IO[E2,Unit], succ: A => IO[E2,Unit]):IO[E2,A] = {
+    io.redeem(e => err(e) *> IO.fail(e), a => succ(a) *> IO.now(a))
+  }
+
+  protected def updateStateWithIO[X](ref: Ref[X])(f: X => IO[Nothing, X]): IO[Nothing, Unit] =
+    for {
+      x    <- ref.get
+      y    <- f(x)
+      unit <- ref.set(y)
+    } yield unit
+
 
   trait RejectedReplacement[+R] {
     def rejectedWhenOpen(circuitWillTryToResetIn: Long): R
@@ -162,7 +166,8 @@ object CircuitBreaker {
         configuration,
         new RejectedReplacement[E] {
           override def rejectedWhenOpen(circuitWillTryToResetIn: Long): E = rejected
-          override def rejectedWhenHalfOpen: E                            = rejected
+
+          override def rejectedWhenHalfOpen: E = rejected
         } //,
         //StatusChangeCallbacks.nocallbacks,
         //RejectionCallbacks.nocallbacks
