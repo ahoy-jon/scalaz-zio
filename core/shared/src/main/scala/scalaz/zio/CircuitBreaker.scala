@@ -7,10 +7,9 @@ import scala.concurrent.duration.Duration
 
 final class CircuitBreaker[+R] private (state: Ref[CircuitStatus],
                                         circuitConfiguration: CircuitConfiguration,
-                                        rejectedReplacement: RejectedReplacement[R] //,
-                                        //statusChangeCallbacks: StatusChangeCallbacks,
-                                        //rejectionCallbacks: RejectionCallbacks
-) {
+                                        rejectedReplacement: RejectedReplacement[R],
+                                        statusChangeCallbacks: StatusChangeCallbacks,
+                                        rejectionCallbacks: RejectionCallbacks) {
 
   import CircuitBreaker._
 
@@ -20,11 +19,13 @@ final class CircuitBreaker[+R] private (state: Ref[CircuitStatus],
       _            <- tick
       currentState <- state.get
       x <- currentState match {
-            case Open(openUtil) => IO.fail(rejectedReplacement.rejectedWhenOpen(openUtil - now))
+            case Open(openUtil) =>
+              rejectionCallbacks.whenOpen.attempt *> IO.fail(rejectedReplacement.rejectedWhenOpen(openUtil - now))
             case _ =>
               peekRedem(io)(
-                _ =>  updateStateWithIO(state)(_.fail(now,circuitConfiguration)),
-                _ =>  updateStateWithIO(state)(_.succ(circuitConfiguration)))
+                _ => updateStateWithIO(state)(_.fail(now, circuitConfiguration, statusChangeCallbacks)),
+                _ => updateStateWithIO(state)(_.succ(circuitConfiguration, statusChangeCallbacks))
+              )
 
           }
     } yield x
@@ -33,8 +34,8 @@ final class CircuitBreaker[+R] private (state: Ref[CircuitStatus],
 
   def tick: IO[Nothing, Unit] =
     for {
-      now   <- scalaz.zio.system.currentTimeMillis
-      unit  <- state.update(_.checkStatus(now)).void
+      now  <- scalaz.zio.system.currentTimeMillis
+      unit <- state.update(_.checkStatus(now)).void
     } yield unit
 
   def forceOpen: IO[Nothing, Unit] =
@@ -48,9 +49,8 @@ final class CircuitBreaker[+R] private (state: Ref[CircuitStatus],
 
 object CircuitBreaker {
 
-  protected def peekRedem[E,A, E2 >: E](io:IO[E,A])(err:E => IO[E2,Unit], succ: A => IO[E2,Unit]):IO[E2,A] = {
+  protected def peekRedem[E, A, E2 >: E](io: IO[E, A])(err: E => IO[E2, Unit], succ: A => IO[E2, Unit]): IO[E2, A] =
     io.redeem(e => err(e) *> IO.fail(e), a => succ(a) *> IO.now(a))
-  }
 
   protected def updateStateWithIO[X](ref: Ref[X])(f: X => IO[Nothing, X]): IO[Nothing, Unit] =
     for {
@@ -58,7 +58,6 @@ object CircuitBreaker {
       y    <- f(x)
       unit <- ref.set(y)
     } yield unit
-
 
   trait RejectedReplacement[+R] {
     def rejectedWhenOpen(circuitWillTryToResetIn: Long): R
@@ -72,18 +71,17 @@ object CircuitBreaker {
     val nocallbacks = RejectionCallbacks(IO.unit, IO.unit)
   }
 
-  case class StatusChangeCallbacks(onClosed: IO[Any, Unit], onHalfOpen: IO[Any, Unit], onOpen: IO[Any, Unit])
+  case class StatusChangeCallbacks(onClosed: IO[Any, Unit] = IO.unit,
+                                   onHalfOpen: IO[Any, Unit] = IO.unit,
+                                   onOpen: IO[Any, Unit] = IO.unit)
 
   object StatusChangeCallbacks {
-
-    val nocallbacks = StatusChangeCallbacks(IO.unit, IO.unit, IO.unit)
-
+    val nocallbacks = StatusChangeCallbacks()
   }
 
   case class CircuitConfiguration(keepClosed: Schedule[Any, Any], openPolicy: Schedule[Any, Any], durationH: Duration)
 
   sealed trait CircuitStatus {
-
     self =>
 
     final def checkStatus(
@@ -95,11 +93,15 @@ object CircuitBreaker {
         case _                                            => self
       }
 
-    final def succ(conf: CircuitConfiguration): IO[Nothing, CircuitStatus] =
+    final def succ(conf: CircuitConfiguration,
+                   statusChangeCallbacks: StatusChangeCallbacks): IO[Nothing, CircuitStatus] = {
+      val closed: IO[Nothing, Closed] = conf.keepClosed.initial.map(x => Closed(x))
       self match {
-        case _: Open => IO.now(self)
-        case _       => conf.keepClosed.initial.map(x => Closed(x))
+        case _: Open   => IO.now(self)
+        case HalfOpen  => statusChangeCallbacks.onHalfOpen.attempt *> closed
+        case _: Closed => closed
       }
+    }
 
     private final def open(now: Long, conf: CircuitConfiguration): IO[Nothing, Open] =
       for {
@@ -111,7 +113,8 @@ object CircuitBreaker {
 
     final def fail(
       now: Long,
-      conf: CircuitConfiguration
+      conf: CircuitConfiguration,
+      statusChangeCallbacks: StatusChangeCallbacks
     ): IO[Nothing, CircuitStatus] =
       self match {
         //TODO move to checkStatus
@@ -122,11 +125,11 @@ object CircuitBreaker {
               if (decision.cont)
                 IO.now(Closed(decision.state))
               else {
-                open(now, conf)
+                statusChangeCallbacks.onOpen.attempt *> open(now, conf)
               }
             })
 
-        case HalfOpen => open(now, conf)
+        case HalfOpen => statusChangeCallbacks.onOpen.attempt *> open(now, conf)
         case _        => IO.now(self)
       }
 
@@ -150,12 +153,15 @@ object CircuitBreaker {
 
   }
 
-  final def apply[E](maxFailures: Int,
-                     durationO: Duration,
-                     durationH: Duration,
-                     rejected: E): IO[Nothing, CircuitBreaker[E]] = {
+  final def apply[E](
+    maxFailures: Int,
+    durationO: Duration,
+    rejected: E,
+    statusChangeCallbacks: StatusChangeCallbacks = StatusChangeCallbacks.nocallbacks,
+    rejectionCallbacks: RejectionCallbacks = RejectionCallbacks.nocallbacks
+  ): IO[Nothing, CircuitBreaker[E]] = {
 
-    val configuration = CircuitConfiguration(Schedule.recurs(maxFailures + 1), Schedule.spaced(durationO), durationH)
+    val configuration = CircuitConfiguration(Schedule.recurs(maxFailures), Schedule.spaced(durationO), Duration.Inf)
 
     for {
       initialState <- configuration.keepClosed.initial
@@ -166,11 +172,10 @@ object CircuitBreaker {
         configuration,
         new RejectedReplacement[E] {
           override def rejectedWhenOpen(circuitWillTryToResetIn: Long): E = rejected
-
-          override def rejectedWhenHalfOpen: E = rejected
-        } //,
-        //StatusChangeCallbacks.nocallbacks,
-        //RejectionCallbacks.nocallbacks
+          override def rejectedWhenHalfOpen: E                            = rejected
+        },
+        statusChangeCallbacks,
+        rejectionCallbacks
       )
     }
   }
